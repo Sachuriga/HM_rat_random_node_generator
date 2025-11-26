@@ -309,7 +309,7 @@ with col1:
     st.subheader("3. Previous History")
     prev_first_node = st.selectbox("Prev Session: First Start Node (Optional)", options=[""] + all_nodes, index=0)
     prev_last_node = st.selectbox("Prev Session: Last Start Node (Optional)", options=[""] + all_nodes, index=0)
-    prev_goal_node = st.selectbox("Prev Session: Goal Node (Optional)", options=[""] + all_nodes, index=0)
+    prev_goal_node = st.selectbox("Previouse Goal Node for new GL/ probe trial(Optional)", options=[""] + all_nodes, index=0)
     
     # --- UPDATED INPUT HANDLING ---
     prev_used_str = st.text_area("Prev Session: ALL Start Nodes (Copy from Excel)", value="", height=150, help="Paste a column from Excel directly.")

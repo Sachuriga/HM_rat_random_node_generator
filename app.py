@@ -294,8 +294,8 @@ col1, col2 = st.columns(2)
 
 with col1:
     st.subheader("2. Experiment Details")
-    rat_id = st.text_input("Rat ID", value="R01")
-    day = st.text_input("Experiment Day", value="Day_01")
+    rat_id = st.text_input("Rat ID", value="RS04")
+    day = st.text_input("Experiment Date", value="20251127")
     num_trials = st.number_input("Number of Trials to Generate", min_value=5, max_value=50, value=20, step=1)
 
     # Dynamic Goal Selection

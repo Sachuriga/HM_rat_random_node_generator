@@ -7,6 +7,7 @@ import numpy as np
 import random
 import io
 import itertools
+import datetime
 
 # ==========================================
 # PAGE CONFIGURATION
@@ -118,32 +119,40 @@ def generate_sequence(G, inputs):
     forced_t1_node = None
     t1_dist_info = ""
 
-    if inputs['is_ngl_pt'] and inputs['prev_goal_node']:
+    if inputs['is_ngl_pt'] and inputs['t1_ref_goal']:
         st.info("Applying HIDDEN RULE: NGL/PT Distance Check")
         candidates = []
         for n in G.nodes():
             if n in total_forbidden: continue
             g = G.nodes[n]['group']
-            if g == inputs['goal_group']: continue 
-            if g == inputs['prev_goal_group']: continue 
-            
+            if g == inputs['goal_group']: continue
+            if g == inputs['t1_ref_group']: continue
+
             try:
                 dist_to_curr_goal = nx.shortest_path_length(G, n, inputs['goal'])
-                if dist_to_curr_goal < MIN_DISTANCE_FROM_GOAL: continue 
+                if dist_to_curr_goal < MIN_DISTANCE_FROM_GOAL: continue
 
-                d_old = nx.shortest_path_length(G, n, inputs['prev_goal_node'])
+                d_old = nx.shortest_path_length(G, n, inputs['t1_ref_goal'])
                 diff = abs(dist_to_curr_goal - d_old)
-                if diff < 3:
-                    candidates.append((n, dist_to_curr_goal, d_old, diff))
+                candidates.append((n, dist_to_curr_goal, d_old, diff))
             except:
                 continue
-        
-        preferred = [c for c in candidates if G.nodes[c[0]]['group'] != inputs['prev_last_group']]
-        selected = random.choice(preferred) if preferred else (random.choice(candidates) if candidates else None)
+
+        # Prefer a start that is EXACTLY equidistant from the current goal and the
+        # old goal, then relax to within 1, then within 2 steps if none qualify.
+        selected = None
+        for max_diff in (0, 1, 2):
+            pool = [c for c in candidates if c[3] <= max_diff]
+            if pool:
+                preferred = [c for c in pool if G.nodes[c[0]]['group'] != inputs['prev_last_group']]
+                selected = random.choice(preferred) if preferred else random.choice(pool)
+                break
 
         if selected:
             forced_t1_node = selected[0]
             t1_dist_info = f" (Dist New: {selected[1]}, Dist Old: {selected[2]}, Diff: {selected[3]})"
+        else:
+            st.caption("Note: No start node was equidistant (within 2 steps) from the current and old goals; trial 1 selected normally.")
 
     # ---------------------------------------------------------
     # STEP 2: Generate Island Sequence
@@ -248,8 +257,15 @@ def create_plot(G, sequence, inputs, extra_info=""):
                                node_color='salmon', node_size=300, node_shape='X', alpha=0.6, ax=ax)
         ax.text(pos[inputs['prev_goal_node']][0], pos[inputs['prev_goal_node']][1]-15, "Prev Goal", fontsize=8, color='salmon', ha='center')
 
+    # 5b. PT Old Goal (probe reference for the trial-1 distance match)
+    old_goal_disp = inputs.get('old_goal_display')
+    if old_goal_disp and old_goal_disp in G.nodes():
+        nx.draw_networkx_nodes(G, pos, nodelist=[old_goal_disp],
+                               node_color='gold', node_size=500, node_shape='X', alpha=0.75, ax=ax)
+        ax.text(pos[old_goal_disp][0], pos[old_goal_disp][1]-15, "Old Goal", fontsize=8, color='goldenrod', ha='center')
+
     # 6. Current Goal
-    nx.draw_networkx_nodes(G, pos, nodelist=[inputs['goal']], node_color='red', 
+    nx.draw_networkx_nodes(G, pos, nodelist=[inputs['goal']], node_color='red',
                            node_size=800, node_shape='*', label='Current Goal', ax=ax)
     
     # 7. New Sequence (The Result)
@@ -268,8 +284,61 @@ def create_plot(G, sequence, inputs, extra_info=""):
     ax.set_title(title_text, fontsize=12, fontweight='bold')
     ax.axis('off')
     ax.invert_yaxis()
-    
+
     return fig
+
+# ==========================================
+# 4. EXCEL-EXPORT HELPERS
+# ==========================================
+
+# Island number -> letter code used in the 'Raw' worksheet.
+ISLAND_MAP = {1: 'i', 2: 'j', 3: 'h', 4: 'e'}
+
+# Column order MUST match the 'Raw' worksheet (columns A..U) so the block
+# can be pasted straight into the sheet with everything lined up.
+RAW_COLUMNS = [
+    'Date', 'Time', 'Experimenter', 'Project', 'Training_order', 'Implant',
+    'subject', 'day', 'session', 'type', 'repeat', 'trial', 'trial_type',
+    'goal_island', 'goal_node', 'goal_island_n', 'goal_node_n',
+    'start_island', 'start_node', 'start_island_n', 'start_node_n',
+]
+
+def node_codes(node_id, G):
+    """Return (island_letter, node_code, island_n, node_n) for a node id.
+    e.g. '120' -> ('i', 'i20', 1, 120)."""
+    grp = G.nodes[node_id]['group']
+    letter = ISLAND_MAP.get(grp, '?')
+    code = f"{letter}{node_id[1:]}"
+    return letter, code, grp, int(node_id)
+
+def assign_trial_types(is_ephys, sess_key, n):
+    """Per-trial 'trial_type' labels following the lab protocol.
+
+    Ephys (30 trials):
+        Normal -> 1,16,30 = 4 ; else 1
+        PT     -> trial 1 = 6 ; 16,30 = 4 ; else 1
+        NGL    -> trial 1 = 4 ; trial 16 = 5 (goal switch) ; trial 30 = 4 ; else 1
+    Non-ephys (20 trials):
+        Normal -> all 1
+        NGL    -> trial 1 = 2 ; else 1
+        PT     -> trial 1 = 3 ; else 1
+    """
+    tt = [1] * n
+    if is_ephys:
+        mid = n // 2  # 0-indexed position of trial 16 when n == 30
+        tt[0] = 4
+        tt[mid] = 4
+        tt[-1] = 4
+        if sess_key == 'PT':
+            tt[0] = 6
+        elif sess_key == 'NGL':
+            tt[mid] = 5
+    else:
+        if sess_key == 'NGL':
+            tt[0] = 2
+        elif sess_key == 'PT':
+            tt[0] = 3
+    return tt
 
 # ==========================================
 # MAIN APP UI
@@ -294,115 +363,222 @@ col1, col2 = st.columns(2)
 
 with col1:
     st.subheader("2. Experiment Details")
-    rat_id = st.text_input("Rat ID", value="RS04")
-    day = st.text_input("Experiment Date", value="20251127")
-    num_trials = st.number_input("Number of Trials to Generate", min_value=5, max_value=50, value=20, step=1)
+    rat_id = st.text_input("Rat ID", value="R01")
+    day = st.text_input("Experiment Day (label for files/plot)", value="Day_01")
+
+    # --- Rat type & session type drive trial count and trial_type labels ---
+    rat_type = st.radio("Rat type", ["Ephys (implanted)", "Non-ephys"], horizontal=True)
+    is_ephys = rat_type.startswith("Ephys")
+
+    session_type = st.radio(
+        "Session type",
+        ["Normal", "NGL (New Goal Location)", "PT (Probe Trial)"],
+        horizontal=True,
+    )
+    sess_key = "NGL" if session_type.startswith("NGL") else ("PT" if session_type.startswith("PT") else "Normal")
+
+    num_trials = 30 if is_ephys else 20
+    st.caption(f"➡️ {num_trials} trials will be generated ({'ephys' if is_ephys else 'non-ephys'}).")
 
     # Dynamic Goal Selection
     all_nodes = sorted(list(G.nodes()), key=lambda x: int(x))
     goal_index = all_nodes.index('118') if '118' in all_nodes else 0
-    goal = st.selectbox("Current Goal Node ID", options=all_nodes, index=goal_index)
-    
+
+    if is_ephys and sess_key == "NGL":
+        goal = st.selectbox("OLD Goal Node (trials 1–15)", options=all_nodes, index=goal_index)
+        new_goal = st.selectbox("NEW Goal Node (trials 16–30)", options=all_nodes, index=goal_index)
+        pt_old_goal = None
+    elif sess_key == "PT":
+        goal = st.selectbox("Current Goal Node ID", options=all_nodes, index=goal_index)
+        new_goal = None
+        pt_old_goal = st.selectbox(
+            "OLD Goal Node (probe reference)",
+            options=all_nodes, index=goal_index,
+            help="Trial 1 start is chosen to be equidistant from this old goal and the current goal.",
+        )
+    else:
+        goal = st.selectbox("Current Goal Node ID", options=all_nodes, index=goal_index)
+        new_goal = None
+        pt_old_goal = None
+
     goal_group = G.nodes[goal]['group']
     st.write(f"📍 *Goal is in Island: {goal_group}*")
 
     st.subheader("3. Previous History")
     prev_first_node = st.selectbox("Prev Session: First Start Node (Optional)", options=[""] + all_nodes, index=0)
     prev_last_node = st.selectbox("Prev Session: Last Start Node (Optional)", options=[""] + all_nodes, index=0)
-    prev_goal_node = st.selectbox("Previouse Goal Node for new GL/ probe trial (Optional)", options=[""] + all_nodes, index=0)
-    
-    # --- UPDATED INPUT HANDLING ---
-    prev_used_str = st.text_area("Prev Session: ALL Start Nodes (Copy from Excel)", value="", height=150, help="Paste a column from Excel directly.")
-    is_ngl_pt = st.checkbox("Is this a New Goal Location (NGL) or Probe Trial (PT)?", value=False)
+    prev_goal_node = st.selectbox("Prev Session: Goal Node (Optional)", options=[""] + all_nodes, index=0)
+
+    prev_used_str = st.text_area("Prev Session: ALL Start Nodes (Copy from Excel)", value="", height=120, help="Paste a column from Excel directly.")
+
+    # NGL/PT sessions trigger the hidden trial-1 distance rule (vs. previous goal).
+    is_ngl_pt = sess_key in ("NGL", "PT")
+
+    st.subheader("4. Excel Paste Settings")
+    with st.expander("Session metadata for the paste-ready 'Raw' table", expanded=True):
+        exp_date = st.text_input("Date (dd.mm.yyyy)", value=datetime.date.today().strftime('%d.%m.%Y'))
+        experimenter = st.text_input("Experimenter", value="")
+        mc1, mc2 = st.columns(2)
+        with mc1:
+            m_subject = st.number_input("subject", value=3, step=1)
+            m_day = st.number_input("day (number)", value=1, step=1)
+            m_session = st.number_input("session", value=1, step=1)
+            m_repeat = st.number_input("repeat", value=1, step=1)
+        with mc2:
+            m_project = st.number_input("Project", value=3, step=1)
+            m_training_order = st.number_input("Training_order", value=6 if is_ephys else 1, step=1)
+            m_type = st.number_input("type", value=1, step=1)
+        m_implant = 1 if is_ephys else 0
+        st.caption(f"Implant will be set to **{m_implant}** ({'ephys' if is_ephys else 'non-ephys'}).")
+        include_header = st.checkbox("Include header row in paste block", value=False)
 
 with col2:
-    st.subheader("4. Generate")
+    st.subheader("5. Generate")
     if st.button("🚀 Generate Sequence", type="primary"):
-        
+
         # --- PARSE EXCEL PASTE / NEWLINES ---
-        # 1. Replace newlines with commas
-        # 2. Split by comma
-        # 3. Strip whitespace
         cleaned_str = prev_used_str.replace('\n', ',').replace('\r', ',')
         prev_used = [x.strip() for x in cleaned_str.split(',') if x.strip()]
-        
+
         # Resolve groups safely
         prev_first_grp = G.nodes[prev_first_node]['group'] if prev_first_node else None
         prev_last_grp = G.nodes[prev_last_node]['group'] if prev_last_node else None
         prev_goal_grp = G.nodes[prev_goal_node]['group'] if prev_goal_node else None
 
-        inputs = {
-            "rat_id": rat_id,
-            "day": day,
-            "num_trials": int(num_trials),
-            "goal": goal,
-            "goal_group": goal_group,
-            "prev_first_node": prev_first_node if prev_first_node else None,
-            "prev_first_group": prev_first_grp,
-            "prev_last_node": prev_last_node if prev_last_node else None,
-            "prev_last_group": prev_last_grp,
-            "prev_goal_node": prev_goal_node if prev_goal_node else None,
-            "prev_goal_group": prev_goal_grp,
-            "prev_used_nodes": prev_used,
-            "is_ngl_pt": is_ngl_pt
-        }
+        # Trial-1 distance reference ("old goal"): PT uses its dedicated OLD goal
+        # input; every other session type falls back to the previous session goal.
+        t1_ref_goal = pt_old_goal if (sess_key == "PT" and pt_old_goal) else (prev_goal_node if prev_goal_node else None)
+        t1_ref_group = G.nodes[t1_ref_goal]['group'] if t1_ref_goal else None
 
-        # Run Logic
+        def make_inputs(the_goal, n_tr, extra_used, ngl_flag):
+            return {
+                "rat_id": rat_id,
+                "day": day,
+                "num_trials": int(n_tr),
+                "goal": the_goal,
+                "goal_group": G.nodes[the_goal]['group'],
+                "prev_first_node": prev_first_node if prev_first_node else None,
+                "prev_first_group": prev_first_grp,
+                "prev_last_node": prev_last_node if prev_last_node else None,
+                "prev_last_group": prev_last_grp,
+                "prev_goal_node": prev_goal_node if prev_goal_node else None,
+                "prev_goal_group": prev_goal_grp,
+                "t1_ref_goal": t1_ref_goal,
+                "t1_ref_group": t1_ref_group,
+                "old_goal_display": pt_old_goal if (sess_key == "PT" and pt_old_goal) else None,
+                "prev_used_nodes": prev_used + extra_used,
+                "is_ngl_pt": ngl_flag,
+            }
+
+        # --- Run Logic (NGL ephys = two goals split 15/15) ---
         with st.spinner("Calculating optimal paths..."):
-            sequence, debug_info = generate_sequence(G, inputs)
+            if is_ephys and sess_key == "NGL":
+                half = num_trials // 2
+                seq1, debug_info = generate_sequence(G, make_inputs(goal, half, [], is_ngl_pt))
+                seq2 = None
+                if seq1:
+                    # Second half: new goal, exclude first-half nodes, no trial-1 hidden rule.
+                    seq2, _ = generate_sequence(G, make_inputs(new_goal, num_trials - half, seq1, False))
+                if seq1 and seq2:
+                    sequence = seq1 + seq2
+                    per_trial_goal = [goal] * half + [new_goal] * (num_trials - half)
+                else:
+                    sequence, per_trial_goal = None, None
+            else:
+                sequence, debug_info = generate_sequence(G, make_inputs(goal, num_trials, [], is_ngl_pt))
+                per_trial_goal = [goal] * num_trials if sequence else None
 
         if sequence:
             st.success("Sequence generated successfully!")
-            
-            # Create Dataframe
-            island_map = {1: 'i', 2: 'j', 3: 'h', 4: 'e'}
-            csv_data = []
+
+            # --- Build paste-ready table matching the 'Raw' worksheet (cols A..U) ---
+            trial_types = assign_trial_types(is_ephys, sess_key, len(sequence))
+
+            rows = []
             for i, node_id in enumerate(sequence):
-                grp_n = G.nodes[node_id]['group']
-                grp_char = island_map.get(grp_n, '?')
-                node_suffix = node_id[1:]
-                node_char = f"{grp_char}{node_suffix}"
-                
-                csv_data.append({
-                    'Trial': i+1,
-                    'Start_Island': grp_char,
-                    'Start_Node': node_char,
-                    'Island_ID': grp_n,
-                    'Node_ID': node_id
+                s_letter, s_code, s_grp, s_num = node_codes(node_id, G)
+                g_letter, g_code, g_grp, g_num = node_codes(per_trial_goal[i], G)
+                rows.append({
+                    'Date': exp_date,
+                    'Time': '',
+                    'Experimenter': experimenter,
+                    'Project': m_project,
+                    'Training_order': m_training_order,
+                    'Implant': m_implant,
+                    'subject': m_subject,
+                    'day': m_day,
+                    'session': m_session,
+                    'type': m_type,
+                    'repeat': m_repeat,
+                    'trial': i + 1,
+                    'trial_type': trial_types[i],
+                    'goal_island': g_letter,
+                    'goal_node': g_code,
+                    'goal_island_n': g_grp,
+                    'goal_node_n': g_num,
+                    'start_island': s_letter,
+                    'start_node': s_code,
+                    'start_island_n': s_grp,
+                    'start_node_n': s_num,
                 })
-            
-            df_out = pd.DataFrame(csv_data)
+
+            df_out = pd.DataFrame(rows, columns=RAW_COLUMNS)
 
             # --- Display Results ---
-            st.dataframe(df_out, use_container_width=True)
+            st.dataframe(df_out, use_container_width=True, hide_index=True)
+
+            # --- Paste-ready block: tab-separated so it drops straight into Excel ---
+            st.markdown("#### 📋 Copy → paste into Excel (Raw sheet)")
+            st.caption(
+                "Click in the box, press Ctrl/Cmd+A to select all, copy, then paste into "
+                "the first empty row of the 'Raw' sheet. Columns line up with A–U."
+            )
+            tsv = df_out.to_csv(sep='\t', index=False, header=include_header)
+            st.text_area("Paste-ready table (tab-separated)", value=tsv, height=280)
 
             # --- Plot ---
-            fig = create_plot(G, sequence, inputs, debug_info)
+            plot_inputs = make_inputs(goal, num_trials, [], is_ngl_pt)
+            fig = create_plot(G, sequence, plot_inputs, debug_info)
             st.pyplot(fig)
 
             # --- Download Buttons ---
-            c1, c2 = st.columns(2)
-            
-            # CSV Download
+            c1, c2, c3 = st.columns(3)
+
+            # CSV Download (always includes header)
             csv = df_out.to_csv(index=False).encode('utf-8')
             c1.download_button(
-                label="📥 Download CSV",
+                label="📥 CSV",
                 data=csv,
                 file_name=f"start_nodes_{rat_id}_{day}.csv",
                 mime="text/csv",
             )
-            
+
+            # Excel Download (same columns as the Raw sheet); degrade gracefully.
+            try:
+                xlsx_buffer = io.BytesIO()
+                with pd.ExcelWriter(xlsx_buffer, engine='openpyxl') as writer:
+                    df_out.to_excel(writer, index=False, sheet_name='start_nodes')
+                xlsx_buffer.seek(0)
+                c2.download_button(
+                    label="📊 Excel",
+                    data=xlsx_buffer,
+                    file_name=f"start_nodes_{rat_id}_{day}.xlsx",
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                )
+            except Exception:
+                c2.caption("Excel export needs `openpyxl`.")
+
             # Image Download
             img_buffer = io.BytesIO()
             fig.savefig(img_buffer, format='png', bbox_inches='tight', dpi=150)
             img_buffer.seek(0)
-            c2.download_button(
-                label="🖼️ Download Map Image",
+            c3.download_button(
+                label="🖼️ Map",
                 data=img_buffer,
                 file_name=f"hexmaze_map_{rat_id}_{day}.png",
                 mime="image/png",
             )
-            
+
         else:
             # Error message is handled in the logic function
             pass

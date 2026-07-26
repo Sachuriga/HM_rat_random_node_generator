@@ -2,14 +2,21 @@ import streamlit as st
 import pandas as pd
 import networkx as nx
 import matplotlib.pyplot as plt
-from scipy.spatial.distance import pdist, squareform
-import numpy as np
-import random
 import io
-import itertools
+import math
 import datetime
 
-from protocol_utils import build_island_sequence, evaluate_protocol_compliance, get_shortest_distance, select_start_node
+from protocol_utils import (
+    HARD_EXCLUDED_NODES,
+    MIN_DISTANCE_FROM_GOAL,
+    build_island_sequence,
+    build_maze_graph,
+    choose_first_trial_group,
+    evaluate_protocol_compliance,
+    island_capacity,
+    select_probe_start_node,
+    select_session_nodes,
+)
 
 # ==========================================
 # PAGE CONFIGURATION
@@ -26,166 +33,197 @@ st.markdown("Generates randomized start nodes based on exclusions, block-based i
 def load_graph(uploaded_file):
     if uploaded_file is None:
         return None
-    
-    # Load node list
+
     df = pd.read_csv(uploaded_file, header=None, names=['id', 'x', 'y'])
-    
-    G = nx.Graph()
+    G, missing_edges = build_maze_graph(df.itertuples(index=False, name=None))
 
-    # Add nodes
-    for idx, row in df.iterrows():
-        node_id = str(int(row['id']))
-        # Group logic: 100s->1, 200s->2, etc.
-        G.add_node(node_id, pos=(row['x'], row['y']), group=int(row['id']) // 100)
-
-    # Add internal edges based on distance
-    coords = df[['x', 'y']].values
-    distances = squareform(pdist(coords))
-    threshold = 65
-    nodes = list(G.nodes())
-
-    for i in range(len(nodes)):
-        for j in range(i + 1, len(nodes)):
-            if distances[i, j] < threshold:
-                G.add_edge(nodes[i], nodes[j])
-
-    # Remove standard dead/unused nodes
-    nodes_to_remove = ['501', '502']
-    for n in nodes_to_remove:
-        if n in G: G.remove_node(n)
-
-    # Add manual bridge connections
-    manual_edges = [('121', '302'), ('324', '401'), ('305', '220'), ('404', '223'), ('201', '124')]
-    
-    # --- VERIFICATION STEP ---
-    all_nodes = set(G.nodes())
-    for u, v in manual_edges:
-        if u in all_nodes and v in all_nodes:
-            G.add_edge(u, v)
-        else:
-            st.warning(f"⚠️ Warning: Manual bridge node missing in CSV: {u}-{v}")
-
-    G.graph['distance_lookup'] = dict(nx.all_pairs_shortest_path_length(G))
+    for u, v in missing_edges:
+        st.warning(f"⚠️ Warning: Manual bridge node missing in CSV: {u}-{v}")
 
     return G
 
 # ==========================================
 # 2. LOGIC GENERATOR
 # ==========================================
+ALL_GROUPS = [1, 2, 3, 4]
+
+# How many independent island orders to try before declaring the constraints
+# unsatisfiable. A retry re-rolls the island sequence and every random choice.
+MAX_SEQUENCE_ATTEMPTS = 40
+
+# How many of the previous session's start nodes may be reused when an island
+# cannot supply enough fresh ones (sessions longer than 20 trials). Taken from
+# the top of the list. The full 20 are offered because the shortfall lands on
+# one island, and only about a quarter of the list sits on any given island -
+# the first ten rarely reach the three or four nodes a bridge goal needs.
+MAX_REUSED_START_NODES = 20
+
+
 def generate_sequence(G, inputs):
-    # --- CONFIGURATION ---
-    TOTAL_TRIALS = inputs['num_trials']
-    MIN_DISTANCE_FROM_GOAL = 4  
-    
-    # --- RULE I: Hard Exclusions ---
-    hard_exclusions = ['213', '214', '215', '220', '305', '310', '311', '312']
-    total_forbidden = set(hard_exclusions + inputs['prev_used_nodes'] + [inputs['goal']])
-    
-    all_groups = [1, 2, 3, 4]
-    available_groups = [g for g in all_groups if g != inputs['goal_group']] 
-    
+    """Build one session's start-node sequence.
+
+    Returns ``(sequence, info)``. ``info`` collects the trial-1 analysis text,
+    any relaxations that were needed and an error message, so that this function
+    stays free of Streamlit calls and can be retried without spamming the UI.
+    """
+    # An ephys NGL session runs on two goals (15 trials each); every other
+    # session is a single segment.
+    segments = inputs['goal_segments']
+    total_trials = sum(n for _, n in segments)
+    per_trial_goals = [g for g, n in segments for _ in range(n)]
+
+    # Trial-1 rules and the capacity diagnostics use the session's first goal.
+    goal_node = segments[0][0]
+    goal_group = G.nodes[goal_node]['group']
+    session_kind = inputs['session_kind']
+
+    info = {'t1_text': '', 'notes': [], 'error': None}
     distance_cache = {}
 
-    # --- HELPER: Get valid node from a specific group ---
-    def get_valid_node(target_group, current_selected, graph, forbidden_set, goal_node):
-        return select_start_node(
-            graph,
-            target_group=target_group,
-            current_selected=current_selected,
-            forbidden_set=forbidden_set,
+    # Nodes that may never be picked this session.
+    forbidden = set(HARD_EXCLUDED_NODES) | {g for g, _ in segments}
+
+    # Rules the protocol qualifies with "do not use ... " but which it also says
+    # to give way on when they clash with the non-adjacency rule.
+    soft_avoid = set(inputs['prev_used_nodes'])
+    if inputs['prev_goal_node']:
+        soft_avoid.add(inputs['prev_goal_node'])
+
+    # Past 20 trials the islands can run out of nodes that satisfy the spacing
+    # rules. The lab's rule for that is to reuse the previous session's start
+    # nodes, taking them from the top of the list.
+    fallback_nodes = list(inputs['prev_used_nodes'])[:MAX_REUSED_START_NODES]
+
+    # ---------------------------------------------------------
+    # STEP 1: Trial 1 (NGL / PT rules)
+    # ---------------------------------------------------------
+    forced_t1_node = None
+    forced_t1_group = None
+
+    if session_kind == 'PT' and inputs['t1_ref_goal']:
+        forced_t1_node, probe_info = select_probe_start_node(
+            G,
             goal_node=goal_node,
-            prev_goal_node=inputs['prev_goal_node'],
-            prev_goal_group=inputs['prev_goal_group'],
-            current_goal_group=inputs['goal_group'],
-            min_distance_from_goal=MIN_DISTANCE_FROM_GOAL,
+            prev_goal_node=inputs['t1_ref_goal'],
+            forbidden_set=forbidden,
+            soft_avoid=soft_avoid,
+            prev_last_group=inputs['prev_last_group'],
+            prev_first_group=inputs['prev_first_group'],
+            island_demand=math.ceil(total_trials / 3),
             distance_cache=distance_cache,
+        )
+        if forced_t1_node:
+            forced_t1_group = G.nodes[forced_t1_node]['group']
+            info['t1_text'] = (
+                f" (Dist New: {probe_info['dist_new']}, "
+                f"Dist Old: {probe_info['dist_old']}, Diff: {probe_info['diff']})"
+            )
+            if 'start_island_topology' in probe_info['relaxed']:
+                info['notes'].append(
+                    "No island is directly connected to both the current and the old goal "
+                    "island; trial 1 fell back to any non-goal island."
+                )
+            if 'equidistance' in probe_info['relaxed']:
+                info['notes'].append(
+                    "No start node was equidistant (within 2 nodes) from both goals; "
+                    "the closest available match was used. Check trial 1 by hand."
+                )
+            if 'first_trial_island_differs_from_prev_last' in probe_info['relaxed']:
+                info['notes'].append(
+                    "Every island that is valid for this probe is the island the previous "
+                    "session ended on; trial 1 had to reuse it. Check trial 1 by hand."
+                )
+        else:
+            info['notes'].append(
+                "No probe start node satisfied the equidistance rule; trial 1 was selected normally."
+            )
+
+    elif session_kind == 'NGL':
+        forced_t1_group = choose_first_trial_group(
+            G,
+            goal_group=goal_group,
+            available_groups=ALL_GROUPS,
+            prev_goal_group=inputs['prev_goal_group'],
+            prev_last_group=inputs['prev_last_group'],
+            prev_first_group=inputs['prev_first_group'],
         )
 
     # ---------------------------------------------------------
-    # STEP 1: Handle Special Start Node (NGL/PT Logic)
+    # STEP 2 + 3: Island order, then nodes. Retry on a dead end.
     # ---------------------------------------------------------
-    forced_t1_node = None
-    t1_dist_info = ""
+    for _ in range(MAX_SEQUENCE_ATTEMPTS):
+        # Each goal segment gets its own block structure; the second one only
+        # has to not repeat the island the first one ended on.
+        island_sequence = []
+        for index, (segment_goal, segment_trials) in enumerate(segments):
+            first_segment = index == 0
+            island_sequence.extend(build_island_sequence(
+                total_trials=segment_trials,
+                available_groups=ALL_GROUPS,
+                goal_group=G.nodes[segment_goal]['group'],
+                forced_t1_group=forced_t1_group if first_segment else None,
+                prev_last_group=(
+                    inputs['prev_last_group'] if first_segment else island_sequence[-1]
+                ),
+                prev_first_group=inputs['prev_first_group'] if first_segment else None,
+            ))
 
-    if inputs['is_ngl_pt'] and inputs['t1_ref_goal']:
-        st.info("Applying HIDDEN RULE: NGL/PT Distance Check")
-        candidates = []
-        for n in G.nodes():
-            if n in total_forbidden: continue
-            g = G.nodes[n]['group']
-            if g == inputs['goal_group']: continue
-            if g == inputs['t1_ref_group']: continue
+        if len(island_sequence) != total_trials:
+            info['error'] = "Could not construct a valid island sequence from the protocol rules."
+            return None, info
 
-            try:
-                dist_to_curr_goal = get_shortest_distance(G, n, inputs['goal'], distance_cache)
-                if dist_to_curr_goal < MIN_DISTANCE_FROM_GOAL: continue
+        allocation = select_session_nodes(
+            G,
+            island_sequence=island_sequence,
+            per_trial_goals=per_trial_goals,
+            forbidden_set=forbidden,
+            soft_avoid=soft_avoid,
+            min_distance_from_goal=MIN_DISTANCE_FROM_GOAL,
+            forced_first_node=forced_t1_node,
+            fallback_nodes=fallback_nodes,
+            distance_cache=distance_cache,
+        )
 
-                d_old = get_shortest_distance(G, n, inputs['t1_ref_goal'], distance_cache)
-                diff = abs(dist_to_curr_goal - d_old)
-                candidates.append((n, dist_to_curr_goal, d_old, diff))
-            except Exception:
-                continue
+        if allocation:
+            sequence = allocation.sequence
+            info['reused'] = allocation.borrowed
+            if info['reused']:
+                info['notes'].append(
+                    f"{len(info['reused'])} start node(s) were reused from the previous "
+                    f"session because the islands cannot supply {total_trials} nodes that "
+                    f"are all >= {MIN_DISTANCE_FROM_GOAL} from the goal and non-adjacent: "
+                    + ", ".join(info['reused'])
+                )
+            return sequence, info
 
-        # Prefer a start that is EXACTLY equidistant from the current goal and the
-        # old goal, then relax to within 1, then within 2 steps if none qualify.
-        selected = None
-        for max_diff in (0, 1, 2):
-            pool = [c for c in candidates if c[3] <= max_diff]
-            if pool:
-                preferred = [c for c in pool if G.nodes[c[0]]['group'] != inputs['prev_last_group']]
-                selected = random.choice(preferred) if preferred else random.choice(pool)
-                break
+    # Explain *why* it failed: compare what each island can supply against what
+    # the block structure asks of it.
+    needed_per_island = math.ceil(total_trials / 3)
+    capacities = {
+        island: island_capacity(
+            G, island=island, goal_node=goal_node, forbidden_set=forbidden,
+            min_distance_from_goal=MIN_DISTANCE_FROM_GOAL, distance_cache=distance_cache,
+        )
+        for island in ALL_GROUPS if island != goal_group
+    }
+    short = {i: c for i, c in capacities.items() if c < needed_per_island}
 
-        if selected:
-            forced_t1_node = selected[0]
-            t1_dist_info = f" (Dist New: {selected[1]}, Dist Old: {selected[2]}, Diff: {selected[3]})"
-        else:
-            st.caption("Note: No start node was equidistant (within 2 steps) from the current and old goals; trial 1 selected normally.")
-
-    # ---------------------------------------------------------
-    # STEP 2: Generate Island Sequence
-    # ---------------------------------------------------------
-    forced_t1_group = G.nodes[forced_t1_node]['group'] if forced_t1_node else None
-    island_sequence = build_island_sequence(
-        total_trials=TOTAL_TRIALS,
-        available_groups=all_groups,
-        goal_group=inputs['goal_group'],
-        forced_t1_group=forced_t1_group,
-        prev_last_group=inputs['prev_last_group'],
-        is_ngl_pt=inputs['is_ngl_pt'],
-    )
-
-    if not island_sequence:
-        st.error("Error: Could not construct a valid island sequence from the protocol rules.")
-        return None, None
-
-    if forced_t1_node and island_sequence[0] != forced_t1_group:
-        st.caption("Note: The protocol-aware island builder adjusted the initial island ordering.")
-
-    # ---------------------------------------------------------
-    # STEP 3: Select Nodes
-    # ---------------------------------------------------------
-    final_sequence = []
-    session_selected_nodes = set()
-    
-    start_index = 0
-    if forced_t1_node:
-        final_sequence.append(forced_t1_node)
-        session_selected_nodes.add(forced_t1_node)
-        start_index = 1
-
-    for i in range(start_index, len(island_sequence)):
-        target_group = island_sequence[i]
-        node = get_valid_node(target_group, session_selected_nodes, G, total_forbidden, inputs['goal'])
-        
-        if not node:
-            st.error(f"Error: Could not find a valid node in Island {target_group} that is >= 4 steps from Goal.")
-            return None, None
-            
-        final_sequence.append(node)
-        session_selected_nodes.add(node)
-
-    return final_sequence, t1_dist_info
+    if short:
+        info['error'] = (
+            f"Goal {goal_node} cannot support {total_trials} trials. A {total_trials}-trial "
+            f"session needs about {needed_per_island} start nodes per island, but island(s) "
+            + ", ".join(f"{i} (max {c})" for i, c in sorted(short.items()))
+            + f" cannot supply that many nodes that are both >= {MIN_DISTANCE_FROM_GOAL} steps "
+            f"from the goal and non-adjacent to each other. Pick a different goal node."
+        )
+    else:
+        info['error'] = (
+            f"Could not satisfy the protocol after {MAX_SEQUENCE_ATTEMPTS} attempts. Island "
+            f"capacities are {capacities} against {needed_per_island} needed per island, so "
+            f"this is very tight. Try generating again, or reduce the list of "
+            f"previous-session start nodes."
+        )
+    return None, info
 
 # ==========================================
 # 3. PLOTTING (UPDATED)
@@ -199,8 +237,7 @@ def create_plot(G, sequence, inputs, extra_info=""):
     nx.draw_networkx_nodes(G, pos, node_color='lightgray', node_size=80, alpha=0.2, ax=ax)
     
     # 2. Never Used (Hard Exclusions)
-    hard_exclusions = ['213', '214', '215', '220', '305', '310', '311', '312']
-    existing_exclusions = [n for n in hard_exclusions if n in G.nodes()]
+    existing_exclusions = [n for n in HARD_EXCLUDED_NODES if n in G.nodes()]
     if existing_exclusions:
         nx.draw_networkx_nodes(G, pos, nodelist=existing_exclusions, 
                                node_color='black', node_size=100, node_shape='x', label='Never Used', ax=ax)
@@ -352,29 +389,45 @@ with col1:
     num_trials = 30 if is_ephys else 20
     st.caption(f"➡️ {num_trials} trials will be generated ({'ephys' if is_ephys else 'non-ephys'}).")
 
-    # Dynamic Goal Selection
+    # Dynamic Goal Selection. The hard-excluded nodes are never used as a start
+    # *or* a goal location, so they are not offered here either.
     all_nodes = sorted(list(G.nodes()), key=lambda x: int(x))
-    goal_index = all_nodes.index('118') if '118' in all_nodes else 0
+    goal_options = [n for n in all_nodes if n not in HARD_EXCLUDED_NODES]
+    goal_index = goal_options.index('118') if '118' in goal_options else 0
 
     if is_ephys and sess_key == "NGL":
-        goal = st.selectbox("OLD Goal Node (trials 1–15)", options=all_nodes, index=goal_index)
-        new_goal = st.selectbox("NEW Goal Node (trials 16–30)", options=all_nodes, index=goal_index)
+        goal = st.selectbox("OLD Goal Node (trials 1–15)", options=goal_options, index=goal_index)
+        # Default the new goal to a different island, since a New Goal Location
+        # session by definition moves the goal.
+        new_default = next(
+            (i for i, n in enumerate(goal_options)
+             if G.nodes[n]['group'] != G.nodes[goal_options[goal_index]]['group']),
+            goal_index,
+        )
+        new_goal = st.selectbox("NEW Goal Node (trials 16–30)", options=goal_options, index=new_default)
         pt_old_goal = None
     elif sess_key == "PT":
-        goal = st.selectbox("Current Goal Node ID", options=all_nodes, index=goal_index)
+        goal = st.selectbox("Current Goal Node ID", options=goal_options, index=goal_index)
         new_goal = None
         pt_old_goal = st.selectbox(
             "OLD Goal Node (probe reference)",
-            options=all_nodes, index=goal_index,
+            options=goal_options, index=goal_index,
             help="Trial 1 start is chosen to be equidistant from this old goal and the current goal.",
         )
     else:
-        goal = st.selectbox("Current Goal Node ID", options=all_nodes, index=goal_index)
+        goal = st.selectbox("Current Goal Node ID", options=goal_options, index=goal_index)
         new_goal = None
         pt_old_goal = None
 
     goal_group = G.nodes[goal]['group']
     st.write(f"📍 *Goal is in Island: {goal_group}*")
+
+    if new_goal is not None and new_goal == goal:
+        st.error(
+            "The NEW goal must differ from the OLD goal — a New Goal Location session "
+            "moves the goal. Pick a different NEW goal node."
+        )
+        st.stop()
 
     st.subheader("3. Previous History")
     prev_first_node = st.selectbox("Prev Session: First Start Node (Optional)", options=[""] + all_nodes, index=0)
@@ -382,9 +435,6 @@ with col1:
     prev_goal_node = st.selectbox("Prev Session: Goal Node (Optional)", options=[""] + all_nodes, index=0)
 
     prev_used_str = st.text_area("Prev Session: ALL Start Nodes (Copy from Excel)", value="", height=120, help="Paste a column from Excel directly.")
-
-    # NGL/PT sessions trigger the hidden trial-1 distance rule (vs. previous goal).
-    is_ngl_pt = sess_key in ("NGL", "PT")
 
     st.subheader("4. Excel Paste Settings")
     with st.expander("Session metadata for the paste-ready 'Raw' table", expanded=True):
@@ -417,18 +467,19 @@ with col2:
         prev_last_grp = G.nodes[prev_last_node]['group'] if prev_last_node else None
         prev_goal_grp = G.nodes[prev_goal_node]['group'] if prev_goal_node else None
 
-        # Trial-1 distance reference ("old goal"): PT uses its dedicated OLD goal
-        # input; every other session type falls back to the previous session goal.
+        # Probe reference ("old goal"): PT uses its dedicated OLD goal input;
+        # every other session type falls back to the previous session goal.
         t1_ref_goal = pt_old_goal if (sess_key == "PT" and pt_old_goal) else (prev_goal_node if prev_goal_node else None)
-        t1_ref_group = G.nodes[t1_ref_goal]['group'] if t1_ref_goal else None
 
-        def make_inputs(the_goal, n_tr, extra_used, ngl_flag):
+        def make_inputs(segments, kind):
             return {
                 "rat_id": rat_id,
                 "day": day,
-                "num_trials": int(n_tr),
-                "goal": the_goal,
-                "goal_group": G.nodes[the_goal]['group'],
+                "goal_segments": segments,
+                # The first segment's goal; used for the plot title and the
+                # trial-1 rules. Later segments come from goal_segments.
+                "goal": segments[0][0],
+                "session_kind": kind,
                 "prev_first_node": prev_first_node if prev_first_node else None,
                 "prev_first_group": prev_first_grp,
                 "prev_last_node": prev_last_node if prev_last_node else None,
@@ -436,29 +487,30 @@ with col2:
                 "prev_goal_node": prev_goal_node if prev_goal_node else None,
                 "prev_goal_group": prev_goal_grp,
                 "t1_ref_goal": t1_ref_goal,
-                "t1_ref_group": t1_ref_group,
                 "old_goal_display": pt_old_goal if (sess_key == "PT" and pt_old_goal) else None,
-                "prev_used_nodes": prev_used + extra_used,
-                "is_ngl_pt": ngl_flag,
+                # Soft: last session's start nodes, which the protocol lets
+                # give way when they clash with the non-adjacency rule.
+                "prev_used_nodes": prev_used,
             }
 
         # --- Run Logic (NGL ephys = two goals split 15/15) ---
         with st.spinner("Calculating optimal paths..."):
+            # An ephys NGL session splits 15/15 across the old and new goal;
+            # it is still one session, so the nodes are allocated in one pass.
             if is_ephys and sess_key == "NGL":
                 half = num_trials // 2
-                seq1, debug_info = generate_sequence(G, make_inputs(goal, half, [], is_ngl_pt))
-                seq2 = None
-                if seq1:
-                    # Second half: new goal, exclude first-half nodes, no trial-1 hidden rule.
-                    seq2, _ = generate_sequence(G, make_inputs(new_goal, num_trials - half, seq1, False))
-                if seq1 and seq2:
-                    sequence = seq1 + seq2
-                    per_trial_goal = [goal] * half + [new_goal] * (num_trials - half)
-                else:
-                    sequence, per_trial_goal = None, None
+                segments = [(goal, half), (new_goal, num_trials - half)]
             else:
-                sequence, debug_info = generate_sequence(G, make_inputs(goal, num_trials, [], is_ngl_pt))
-                per_trial_goal = [goal] * num_trials if sequence else None
+                segments = [(goal, num_trials)]
+
+            sequence, gen_info = generate_sequence(G, make_inputs(segments, sess_key))
+            per_trial_goal = [g for g, n in segments for _ in range(n)] if sequence else None
+
+        debug_info = gen_info.get('t1_text', '')
+        for note in gen_info.get('notes', []):
+            st.caption(f"Note: {note}")
+        if gen_info.get('error'):
+            st.error(gen_info['error'])
 
         if sequence:
             st.success("Sequence generated successfully!")
@@ -512,41 +564,49 @@ with col2:
             compliance = evaluate_protocol_compliance(
                 G,
                 sequence,
-                goal_node=goal,
-                prev_goal_node=prev_goal_node,
-                prev_goal_group=prev_goal_grp,
-                current_goal_group=goal_group,
+                per_trial_goals=per_trial_goal,
+                session_kind=sess_key,
+                prev_goal_node=prev_goal_node if prev_goal_node else None,
+                probe_reference_goal=t1_ref_goal if sess_key == "PT" else None,
                 prev_used_nodes=prev_used,
-                goal_group=goal_group,
-                is_ngl_pt=is_ngl_pt,
+                reused_nodes=gen_info.get('reused', []),
+                prev_first_group=prev_first_grp,
                 prev_last_group=prev_last_grp,
-                min_distance_from_goal=4,
+                min_distance_from_goal=MIN_DISTANCE_FROM_GOAL,
             )
             if compliance:
                 st.subheader("Protocol compliance check")
-                failed_items = [item for item in compliance if not item['passed']]
-                for item in compliance:
-                    icon = "✅" if item['passed'] else "❌"
-                    color = "green" if item['passed'] else "red"
-                    st.markdown(f"<div style='color:{color};font-weight:600'>{icon} {item['name']}: {item['details']}</div>", unsafe_allow_html=True)
+                hard_failures = [i for i in compliance if not i['passed'] and i['severity'] == 'hard']
+                soft_failures = [i for i in compliance if not i['passed'] and i['severity'] == 'soft']
 
-                if failed_items:
-                    replacement_candidates = []
-                    for item in failed_items:
-                        if item['name'] == 'distance_to_goal':
-                            replacement_candidates.extend(sequence)
-                        elif item['name'] == 'avoid_previous_session_nodes':
-                            replacement_candidates.extend([node for node in sequence if node in prev_used_nodes or node == prev_goal_node])
-                        elif item['name'] == 'start_island_differs_from_prev_last':
-                            replacement_candidates.append(sequence[0])
-                    replacement_candidates = sorted(set(replacement_candidates))
-                    if replacement_candidates:
-                        st.warning(f"Manual replacement candidates: {', '.join(replacement_candidates)}")
+                for item in compliance:
+                    if item['passed']:
+                        icon, color = "✅", "green"
+                    elif item['severity'] == 'soft':
+                        icon, color = "⚠️", "orange"
                     else:
-                        st.info("No obvious manual replacement candidates were identified from the failed checks.")
+                        icon, color = "❌", "red"
+                    st.markdown(
+                        f"<div style='color:{color};font-weight:600'>{icon} {item['name']}: {item['details']}</div>",
+                        unsafe_allow_html=True,
+                    )
+
+                if hard_failures:
+                    st.error(
+                        "This sequence breaks a mandatory rule and must not be used as-is: "
+                        + ", ".join(i['name'] for i in hard_failures)
+                    )
+                elif soft_failures:
+                    st.warning(
+                        "All mandatory rules pass. The protocol allows these to give way when "
+                        "they cannot all be met at once: "
+                        + ", ".join(i['name'] for i in soft_failures)
+                    )
+                else:
+                    st.success("Every protocol rule passes.")
 
             # --- Plot ---
-            plot_inputs = make_inputs(goal, num_trials, [], is_ngl_pt)
+            plot_inputs = make_inputs(segments, sess_key)
             fig = create_plot(G, sequence, plot_inputs, debug_info)
             st.pyplot(fig)
 

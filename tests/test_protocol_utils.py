@@ -6,6 +6,7 @@ import networkx as nx
 from protocol_utils import (
     build_island_sequence,
     evaluate_protocol_compliance,
+    get_shortest_distance,
     is_topologically_valid_group,
     select_start_node,
 )
@@ -68,6 +69,16 @@ def test_select_start_node_prefers_dispersion_and_distance():
     )
 
     assert selected == '101'
+
+
+def test_get_shortest_distance_uses_cache_for_repeated_lookup():
+    graph = nx.Graph()
+    graph.add_edges_from([('101', '102'), ('102', '103')])
+
+    distance_cache = {}
+    assert get_shortest_distance(graph, '101', '103', distance_cache) == 2
+    assert get_shortest_distance(graph, '101', '103', distance_cache) == 2
+    assert distance_cache[('101', '103')] == 2
 
 
 def test_evaluate_protocol_compliance_reports_sequence_checks():

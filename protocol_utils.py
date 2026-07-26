@@ -1,7 +1,46 @@
 import random
-from typing import List, Optional
+from typing import Dict, List, Optional, Tuple
 
 import networkx as nx
+
+
+def get_shortest_distance(
+    graph: nx.Graph,
+    source: str,
+    target: str,
+    cache: Optional[Dict[Tuple[str, str], int]] = None,
+) -> int:
+    """Return the shortest-path distance between two nodes, using a cache when provided."""
+    if cache is not None:
+        key = (source, target)
+        reverse_key = (target, source)
+        if key in cache:
+            return cache[key]
+        if reverse_key in cache:
+            return cache[reverse_key]
+
+    distance_lookup = graph.graph.get('distance_lookup')
+    if distance_lookup is not None:
+        try:
+            distance = distance_lookup[source][target]
+        except (KeyError, TypeError):
+            distance = None
+        if distance is not None:
+            if cache is not None:
+                cache[key] = distance
+                cache[reverse_key] = distance
+            return distance
+
+    try:
+        distance = nx.shortest_path_length(graph, source=source, target=target)
+    except nx.NetworkXNoPath:
+        distance = float('inf')
+
+    if cache is not None:
+        cache[key] = distance
+        cache[reverse_key] = distance
+
+    return int(distance) if distance != float('inf') else float('inf')
 
 
 def build_island_sequence(
@@ -103,6 +142,7 @@ def select_start_node(
     prev_goal_group: Optional[int],
     current_goal_group: int,
     min_distance_from_goal: int,
+    distance_cache: Optional[Dict[Tuple[str, str], int]] = None,
 ) -> Optional[str]:
     """Pick the most protocol-compliant node from the target island."""
     candidates = [
@@ -115,18 +155,15 @@ def select_start_node(
 
     valid = []
     for node in candidates:
-        try:
-            if nx.shortest_path_length(graph, source=node, target=goal_node) < min_distance_from_goal:
-                continue
-        except nx.NetworkXNoPath:
+        dist_to_goal = get_shortest_distance(graph, node, goal_node, distance_cache)
+        if dist_to_goal != float('inf') and dist_to_goal < min_distance_from_goal:
+            continue
+        if dist_to_goal == float('inf'):
             continue
 
         if prev_goal_node:
-            try:
-                prev_dist = nx.shortest_path_length(graph, source=node, target=prev_goal_node)
-                curr_dist = nx.shortest_path_length(graph, source=node, target=goal_node)
-            except nx.NetworkXNoPath:
-                prev_dist = curr_dist = float('inf')
+            prev_dist = get_shortest_distance(graph, node, prev_goal_node, distance_cache)
+            curr_dist = dist_to_goal
             if prev_dist != float('inf') and curr_dist != float('inf'):
                 if abs(prev_dist - curr_dist) > 2:
                     continue
@@ -149,10 +186,7 @@ def select_start_node(
         for node in valid:
             dist_to_selected = []
             for selected in current_selected:
-                try:
-                    dist_to_selected.append(nx.shortest_path_length(graph, source=node, target=selected))
-                except nx.NetworkXNoPath:
-                    dist_to_selected.append(10)
+                dist_to_selected.append(get_shortest_distance(graph, node, selected, distance_cache))
             avg_distance = sum(dist_to_selected) / max(1, len(dist_to_selected))
             node_num = int(node[1:]) if node[1:].isdigit() else 0
             scored.append((avg_distance, -node_num, node))
@@ -177,6 +211,7 @@ def evaluate_protocol_compliance(
     is_ngl_pt: bool,
     prev_last_group: Optional[int],
     min_distance_from_goal: int,
+    distance_cache: Optional[Dict[Tuple[str, str], int]] = None,
 ) -> List[dict]:
     """Return a list of protocol checks with pass/fail status for a generated sequence."""
     checks = []
@@ -197,10 +232,7 @@ def evaluate_protocol_compliance(
     # 3. Each trial should be at least min_distance_from_goal away from current goal.
     distance_checks = []
     for node in sequence:
-        try:
-            dist = nx.shortest_path_length(graph, source=node, target=goal_node)
-        except nx.NetworkXNoPath:
-            dist = float('inf')
+        dist = get_shortest_distance(graph, node, goal_node, distance_cache)
         distance_checks.append(dist)
     passed = all(dist >= min_distance_from_goal for dist in distance_checks if dist != float('inf'))
     checks.append({'name': 'distance_to_goal', 'passed': passed, 'details': distance_checks})

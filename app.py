@@ -9,7 +9,7 @@ import io
 import itertools
 import datetime
 
-from protocol_utils import build_island_sequence, evaluate_protocol_compliance, select_start_node
+from protocol_utils import build_island_sequence, evaluate_protocol_compliance, get_shortest_distance, select_start_node
 
 # ==========================================
 # PAGE CONFIGURATION
@@ -65,6 +65,8 @@ def load_graph(uploaded_file):
         else:
             st.warning(f"⚠️ Warning: Manual bridge node missing in CSV: {u}-{v}")
 
+    G.graph['distance_lookup'] = dict(nx.all_pairs_shortest_path_length(G))
+
     return G
 
 # ==========================================
@@ -82,6 +84,8 @@ def generate_sequence(G, inputs):
     all_groups = [1, 2, 3, 4]
     available_groups = [g for g in all_groups if g != inputs['goal_group']] 
     
+    distance_cache = {}
+
     # --- HELPER: Get valid node from a specific group ---
     def get_valid_node(target_group, current_selected, graph, forbidden_set, goal_node):
         return select_start_node(
@@ -94,6 +98,7 @@ def generate_sequence(G, inputs):
             prev_goal_group=inputs['prev_goal_group'],
             current_goal_group=inputs['goal_group'],
             min_distance_from_goal=MIN_DISTANCE_FROM_GOAL,
+            distance_cache=distance_cache,
         )
 
     # ---------------------------------------------------------
@@ -112,13 +117,13 @@ def generate_sequence(G, inputs):
             if g == inputs['t1_ref_group']: continue
 
             try:
-                dist_to_curr_goal = nx.shortest_path_length(G, n, inputs['goal'])
+                dist_to_curr_goal = get_shortest_distance(G, n, inputs['goal'], distance_cache)
                 if dist_to_curr_goal < MIN_DISTANCE_FROM_GOAL: continue
 
-                d_old = nx.shortest_path_length(G, n, inputs['t1_ref_goal'])
+                d_old = get_shortest_distance(G, n, inputs['t1_ref_goal'], distance_cache)
                 diff = abs(dist_to_curr_goal - d_old)
                 candidates.append((n, dist_to_curr_goal, d_old, diff))
-            except:
+            except Exception:
                 continue
 
         # Prefer a start that is EXACTLY equidistant from the current goal and the

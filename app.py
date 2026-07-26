@@ -9,6 +9,8 @@ import io
 import itertools
 import datetime
 
+from protocol_utils import build_island_sequence, evaluate_protocol_compliance, select_start_node
+
 # ==========================================
 # PAGE CONFIGURATION
 # ==========================================
@@ -82,36 +84,17 @@ def generate_sequence(G, inputs):
     
     # --- HELPER: Get valid node from a specific group ---
     def get_valid_node(target_group, current_selected, graph, forbidden_set, goal_node):
-        candidates = [n for n, attr in graph.nodes(data=True) if attr.get('group') == target_group]
-        
-        # Filter: Forbidden & Already Selected
-        candidates = [n for n in candidates if n not in forbidden_set]
-        candidates = [n for n in candidates if n not in current_selected]
-        
-        # Filter: Distance Check
-        dist_candidates = []
-        for n in candidates:
-            try:
-                dist = nx.shortest_path_length(graph, source=n, target=goal_node)
-                if dist >= MIN_DISTANCE_FROM_GOAL:
-                    dist_candidates.append(n)
-            except nx.NetworkXNoPath:
-                pass 
-        candidates = dist_candidates
-
-        if not candidates:
-            return None
-
-        # Filter: Dispersion
-        dispersion_candidates = []
-        for cand in candidates:
-            neighbors = list(graph.neighbors(cand))
-            if not any(n in current_selected for n in neighbors):
-                dispersion_candidates.append(cand)
-        
-        if dispersion_candidates:
-            return random.choice(dispersion_candidates)
-        return random.choice(candidates)
+        return select_start_node(
+            graph,
+            target_group=target_group,
+            current_selected=current_selected,
+            forbidden_set=forbidden_set,
+            goal_node=goal_node,
+            prev_goal_node=inputs['prev_goal_node'],
+            prev_goal_group=inputs['prev_goal_group'],
+            current_goal_group=inputs['goal_group'],
+            min_distance_from_goal=MIN_DISTANCE_FROM_GOAL,
+        )
 
     # ---------------------------------------------------------
     # STEP 1: Handle Special Start Node (NGL/PT Logic)
@@ -157,38 +140,22 @@ def generate_sequence(G, inputs):
     # ---------------------------------------------------------
     # STEP 2: Generate Island Sequence
     # ---------------------------------------------------------
-    island_sequence = []
-    first_block_pool = list(available_groups)
-    
-    if forced_t1_node:
-        t1_group = G.nodes[forced_t1_node]['group']
-        island_sequence.append(t1_group)
-        if t1_group in first_block_pool:
-            first_block_pool.remove(t1_group)
-        random.shuffle(first_block_pool)
-        island_sequence.extend(first_block_pool)
-    else:
-        random.shuffle(first_block_pool)
-        # Prevent same start island as prev session last island (unless NGL)
-        if not inputs['is_ngl_pt'] and inputs['prev_last_group'] is not None:
-            retries = 0
-            while first_block_pool[0] == inputs['prev_last_group'] and retries < 50:
-                random.shuffle(first_block_pool)
-                retries += 1
-            if retries > 0 and retries < 50:
-                st.caption(f"Note: Adjusted starting island to ensure it differs from Previous Session Last Island ({inputs['prev_last_group']}).")
-        island_sequence.extend(first_block_pool)
+    forced_t1_group = G.nodes[forced_t1_node]['group'] if forced_t1_node else None
+    island_sequence = build_island_sequence(
+        total_trials=TOTAL_TRIALS,
+        available_groups=all_groups,
+        goal_group=inputs['goal_group'],
+        forced_t1_group=forced_t1_group,
+        prev_last_group=inputs['prev_last_group'],
+        is_ngl_pt=inputs['is_ngl_pt'],
+    )
 
-    while len(island_sequence) < TOTAL_TRIALS:
-        block = list(available_groups)
-        random.shuffle(block)
-        retries = 0
-        while block[0] == island_sequence[-1] and retries < 10:
-            random.shuffle(block)
-            retries += 1
-        island_sequence.extend(block)
-    
-    island_sequence = island_sequence[:TOTAL_TRIALS]
+    if not island_sequence:
+        st.error("Error: Could not construct a valid island sequence from the protocol rules.")
+        return None, None
+
+    if forced_t1_node and island_sequence[0] != forced_t1_group:
+        st.caption("Note: The protocol-aware island builder adjusted the initial island ordering.")
 
     # ---------------------------------------------------------
     # STEP 3: Select Nodes
@@ -535,6 +502,43 @@ with col2:
             )
             tsv = df_out.to_csv(sep='\t', index=False, header=include_header)
             st.text_area("Paste-ready table (tab-separated)", value=tsv, height=280)
+
+            # --- Protocol compliance report ---
+            compliance = evaluate_protocol_compliance(
+                G,
+                sequence,
+                goal_node=goal,
+                prev_goal_node=prev_goal_node,
+                prev_goal_group=prev_goal_grp,
+                current_goal_group=goal_group,
+                prev_used_nodes=prev_used,
+                goal_group=goal_group,
+                is_ngl_pt=is_ngl_pt,
+                prev_last_group=prev_last_grp,
+                min_distance_from_goal=4,
+            )
+            if compliance:
+                st.subheader("Protocol compliance check")
+                failed_items = [item for item in compliance if not item['passed']]
+                for item in compliance:
+                    icon = "✅" if item['passed'] else "❌"
+                    color = "green" if item['passed'] else "red"
+                    st.markdown(f"<div style='color:{color};font-weight:600'>{icon} {item['name']}: {item['details']}</div>", unsafe_allow_html=True)
+
+                if failed_items:
+                    replacement_candidates = []
+                    for item in failed_items:
+                        if item['name'] == 'distance_to_goal':
+                            replacement_candidates.extend(sequence)
+                        elif item['name'] == 'avoid_previous_session_nodes':
+                            replacement_candidates.extend([node for node in sequence if node in prev_used_nodes or node == prev_goal_node])
+                        elif item['name'] == 'start_island_differs_from_prev_last':
+                            replacement_candidates.append(sequence[0])
+                    replacement_candidates = sorted(set(replacement_candidates))
+                    if replacement_candidates:
+                        st.warning(f"Manual replacement candidates: {', '.join(replacement_candidates)}")
+                    else:
+                        st.info("No obvious manual replacement candidates were identified from the failed checks.")
 
             # --- Plot ---
             plot_inputs = make_inputs(goal, num_trials, [], is_ngl_pt)
